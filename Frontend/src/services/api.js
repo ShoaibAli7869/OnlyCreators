@@ -23,7 +23,21 @@ function resolveBaseURL() {
 
   if (envUrl) {
     // Strip trailing slash for consistency
-    return envUrl.replace(/\/+$/, "");
+    const cleaned = envUrl.replace(/\/+$/, "");
+
+    // Catch the most common misconfiguration: setting the URL to just the
+    // domain without the /api suffix. All service calls use paths like
+    // "/auth/login", "/analytics/overview", etc. — they expect the base
+    // URL to already include "/api".
+    if (!cleaned.endsWith("/api")) {
+      console.error(
+        `[api.js] VITE_API_URL is set to "${envUrl}" but it must end with "/api". ` +
+          `Example: "https://your-backend.vercel.app/api". ` +
+          `Requests will likely 404 without the /api suffix.`,
+      );
+    }
+
+    return cleaned;
   }
 
   return "/api";
