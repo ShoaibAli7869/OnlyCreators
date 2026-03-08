@@ -14,6 +14,10 @@ const trendsRoutes = require("./routes/trendsRoutes");
 // Initialize Express app
 const app = express();
 
+// Track DB initialization state for serverless
+let dbInitialized = false;
+let dbInitPromise = null;
+
 /**
  * Auto-seed the database with demo data if collections are empty.
  * This runs on every startup when using in-memory MongoDB so data is always available,
@@ -650,8 +654,28 @@ const autoSeed = async () => {
   }
 };
 
-// Connect to MongoDB then auto-seed
-connectDB().then(() => autoSeed());
+/**
+ * Initialize database connection and seed (once).
+ * Safe for serverless: uses a cached promise so concurrent requests
+ * don't trigger multiple connection attempts.
+ */
+const initDB = async () => {
+  if (dbInitialized) return;
+  if (dbInitPromise) return dbInitPromise;
+
+  dbInitPromise = (async () => {
+    try {
+      await connectDB();
+      await autoSeed();
+      dbInitialized = true;
+    } catch (error) {
+      dbInitPromise = null; // Allow retry on next request
+      throw error;
+    }
+  })();
+
+  return dbInitPromise;
+};
 
 // ---------------------
 // MIDDLEWARE
@@ -660,21 +684,49 @@ connectDB().then(() => autoSeed());
 // CORS configuration - allow frontend to communicate with backend
 const corsOptions = {
   origin: function (origin, callback) {
+    // Build allowed origins from env + common local dev URLs
     const allowedOrigins = [
-      process.env.CLIENT_URL || "http://localhost:5173",
       "http://localhost:5173",
       "http://localhost:5174",
       "http://localhost:3000",
       "http://127.0.0.1:5173",
     ];
 
-    // Allow requests with no origin (mobile apps, curl, Postman, etc.)
-    if (!origin || allowedOrigins.includes(origin)) {
-      callback(null, true);
-    } else {
-      console.warn(`⚠️  CORS blocked request from origin: ${origin}`);
-      callback(null, true); // In development, allow all origins
+    // Add CLIENT_URL from env if set
+    if (process.env.CLIENT_URL) {
+      allowedOrigins.push(process.env.CLIENT_URL);
     }
+
+    // Add any additional origins from ALLOWED_ORIGINS env (comma-separated)
+    if (process.env.ALLOWED_ORIGINS) {
+      process.env.ALLOWED_ORIGINS.split(",")
+        .map((o) => o.trim())
+        .filter(Boolean)
+        .forEach((o) => allowedOrigins.push(o));
+    }
+
+    // Allow requests with no origin (mobile apps, curl, Postman, server-to-server)
+    if (!origin) {
+      return callback(null, true);
+    }
+
+    // Allow any *.vercel.app origin (covers preview + production deployments)
+    if (origin.endsWith(".vercel.app")) {
+      return callback(null, true);
+    }
+
+    // Check explicit allow list
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+
+    // In development, allow all origins as a fallback
+    if (process.env.NODE_ENV !== "production") {
+      return callback(null, true);
+    }
+
+    console.warn(`⚠️  CORS blocked request from origin: ${origin}`);
+    callback(new Error(`Origin ${origin} not allowed by CORS`));
   },
   credentials: true, // Allow cookies to be sent
   methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
@@ -689,6 +741,8 @@ const corsOptions = {
   maxAge: 86400, // Cache preflight for 24 hours
 };
 
+// Handle preflight OPTIONS requests explicitly for all routes
+app.options("*", cors(corsOptions));
 app.use(cors(corsOptions));
 
 // Body parsing middleware
@@ -706,6 +760,26 @@ if (process.env.NODE_ENV === "development") {
     }),
   );
 }
+
+// Middleware: ensure DB is connected before handling any /api request.
+// This MUST come after CORS and body parsing so that preflight OPTIONS
+// requests always receive proper CORS headers even if the DB is down.
+app.use("/api", async (req, res, next) => {
+  // Skip DB init for OPTIONS preflight requests — they only need CORS headers
+  if (req.method === "OPTIONS") {
+    return next();
+  }
+  try {
+    await initDB();
+    next();
+  } catch (error) {
+    console.error("❌ DB initialization failed:", error.message);
+    res.status(503).json({
+      success: false,
+      message: "Service temporarily unavailable. Database connection failed.",
+    });
+  }
+});
 
 // ---------------------
 // ROUTES
@@ -795,27 +869,44 @@ app.use(errorHandler);
 
 const PORT = process.env.PORT || 5000;
 
-const server = app.listen(PORT, () => {
-  console.log("\n🚀 ==========================================");
-  console.log(`   OnlyCreators API Server`);
-  console.log("   ==========================================");
-  console.log(`   🌍 Environment : ${process.env.NODE_ENV || "development"}`);
-  console.log(`   🔗 Server URL  : http://localhost:${PORT}`);
-  console.log(`   📡 API Base    : http://localhost:${PORT}/api`);
-  console.log(`   ❤️  Health      : http://localhost:${PORT}/api/health`);
-  console.log(
-    `   🖥️  Frontend    : ${process.env.CLIENT_URL || "http://localhost:5173"}`,
-  );
-  console.log("   ==========================================\n");
-});
+// Track the server instance for graceful shutdown (only set in local mode)
+let server = null;
+
+// Only start listening when run directly (not imported by Vercel)
+if (require.main === module) {
+  // For local development, eagerly initialize DB then start server
+  initDB()
+    .then(() => {
+      server = app.listen(PORT, () => {
+        console.log("\n🚀 ==========================================");
+        console.log(`   OnlyCreators API Server`);
+        console.log("   ==========================================");
+        console.log(
+          `   🌍 Environment : ${process.env.NODE_ENV || "development"}`,
+        );
+        console.log(`   🔗 Server URL  : http://localhost:${PORT}`);
+        console.log(`   📡 API Base    : http://localhost:${PORT}/api`);
+        console.log(`   ❤️  Health      : http://localhost:${PORT}/api/health`);
+        console.log(
+          `   🖥️  Frontend    : ${process.env.CLIENT_URL || "http://localhost:5173"}`,
+        );
+        console.log("   ==========================================\n");
+      });
+    })
+    .catch((err) => {
+      console.error("❌ Failed to start server:", err.message);
+      process.exit(1);
+    });
+}
 
 // Handle unhandled promise rejections
 process.on("unhandledRejection", (err) => {
   console.error(`\n❌ Unhandled Promise Rejection: ${err.message}`);
-  // Close server & exit process
-  server.close(() => {
+  if (server) {
+    server.close(() => process.exit(1));
+  } else {
     process.exit(1);
-  });
+  }
 });
 
 // Handle uncaught exceptions
@@ -824,21 +915,30 @@ process.on("uncaughtException", (err) => {
   process.exit(1);
 });
 
-// Graceful shutdown
+// Graceful shutdown (only relevant in local server mode)
 process.on("SIGTERM", () => {
   console.log("\n👋 SIGTERM received. Shutting down gracefully...");
-  server.close(() => {
-    console.log("💤 Server closed.");
+  if (server) {
+    server.close(() => {
+      console.log("💤 Server closed.");
+      process.exit(0);
+    });
+  } else {
     process.exit(0);
-  });
+  }
 });
 
 process.on("SIGINT", () => {
   console.log("\n👋 SIGINT received. Shutting down gracefully...");
-  server.close(() => {
-    console.log("💤 Server closed.");
+  if (server) {
+    server.close(() => {
+      console.log("💤 Server closed.");
+      process.exit(0);
+    });
+  } else {
     process.exit(0);
-  });
+  }
 });
 
+// Export the Express app for Vercel serverless
 module.exports = app;

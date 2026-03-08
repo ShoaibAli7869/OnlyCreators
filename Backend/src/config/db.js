@@ -1,80 +1,91 @@
 const mongoose = require("mongoose");
 
+/**
+ * Cached connection for serverless environments (Vercel).
+ * In serverless, each cold start re-imports modules, but the global scope
+ * persists across warm invocations within the same container.
+ */
+let cachedConnection = null;
+let isConnecting = false;
+
 const connectDB = async () => {
-  try {
-    let mongoURI =
-      process.env.MONGODB_URI || "mongodb://localhost:27017/onlycreators";
-    let usingMemoryServer = false;
+  // If we already have a ready connection, reuse it
+  if (cachedConnection && mongoose.connection.readyState === 1) {
+    return cachedConnection;
+  }
 
-    try {
-      // First, try connecting to the configured MongoDB URI
-      const conn = await mongoose.connect(mongoURI, {
-        serverSelectionTimeoutMS: 3000,
-        socketTimeoutMS: 45000,
-      });
-
-      console.log(`✅ MongoDB Connected: ${conn.connection.host}`);
-      console.log(`   Database: ${conn.connection.name}`);
-    } catch (initialError) {
-      // If local MongoDB isn't available, fall back to in-memory server
-      console.warn(`⚠️  Could not connect to MongoDB at ${mongoURI}`);
-      console.log(
-        "📦 Starting in-memory MongoDB server (mongodb-memory-server)...",
-      );
-
-      try {
-        const { MongoMemoryServer } = require("mongodb-memory-server");
-        const mongoServer = await MongoMemoryServer.create();
-        mongoURI = mongoServer.getUri();
-        usingMemoryServer = true;
-
-        await mongoose.connect(mongoURI, {
-          serverSelectionTimeoutMS: 5000,
-          socketTimeoutMS: 45000,
-        });
-
-        console.log(`✅ In-Memory MongoDB Connected`);
-        console.log(`   URI: ${mongoURI}`);
-        console.log(`   ⚠️  Data will NOT persist between restarts.`);
-        console.log(`   💡 Install MongoDB locally for persistent data.`);
-
-        // Store reference for cleanup
-        process.mongoServer = mongoServer;
-      } catch (memoryServerError) {
-        console.error(
-          "❌ Failed to start in-memory MongoDB server:",
-          memoryServerError.message,
-        );
-        console.error("\n💡 To fix this, install MongoDB locally:");
-        console.error(
-          "   Ubuntu/Mint: https://www.mongodb.com/docs/manual/tutorial/install-mongodb-on-ubuntu/",
-        );
-        console.error(
-          "   Or use Docker: docker run -d -p 27017:27017 --name mongodb mongo:latest\n",
-        );
-        process.exit(1);
-      }
+  // If a connection attempt is already in progress, wait for it
+  if (isConnecting) {
+    // Wait until the existing connection attempt resolves
+    await new Promise((resolve) => {
+      const interval = setInterval(() => {
+        if (!isConnecting) {
+          clearInterval(interval);
+          resolve();
+        }
+      }, 100);
+    });
+    if (cachedConnection && mongoose.connection.readyState === 1) {
+      return cachedConnection;
     }
+  }
+
+  isConnecting = true;
+
+  try {
+    const mongoURI = process.env.MONGODB_URI;
+
+    if (!mongoURI) {
+      throw new Error(
+        "MONGODB_URI environment variable is not set. " +
+          "Please configure it in your Vercel project settings or .env file. " +
+          "You can get a free MongoDB Atlas cluster at https://www.mongodb.com/cloud/atlas",
+      );
+    }
+
+    // Mongoose options optimized for serverless
+    const options = {
+      serverSelectionTimeoutMS: 5000,
+      socketTimeoutMS: 45000,
+      // Buffer commands until connection is established
+      bufferCommands: true,
+      // Keep the connection pool small for serverless
+      maxPoolSize: 10,
+      minPoolSize: 0,
+      // Close idle connections faster in serverless
+      maxIdleTimeMS: 10000,
+    };
+
+    const conn = await mongoose.connect(mongoURI, options);
+
+    cachedConnection = conn.connection;
+
+    console.log(`✅ MongoDB Connected: ${conn.connection.host}`);
+    console.log(`   Database: ${conn.connection.name}`);
 
     // Handle connection events
     mongoose.connection.on("error", (err) => {
       console.error(`❌ MongoDB connection error: ${err.message}`);
+      cachedConnection = null;
     });
 
     mongoose.connection.on("disconnected", () => {
-      if (!usingMemoryServer) {
-        console.warn("⚠️  MongoDB disconnected. Attempting to reconnect...");
-      }
+      console.warn("⚠️  MongoDB disconnected");
+      cachedConnection = null;
     });
 
     mongoose.connection.on("reconnected", () => {
       console.log("✅ MongoDB reconnected successfully");
+      cachedConnection = mongoose.connection;
     });
 
-    return mongoose.connection;
+    return cachedConnection;
   } catch (error) {
+    cachedConnection = null;
     console.error(`❌ MongoDB Connection Failed: ${error.message}`);
-    process.exit(1);
+    throw error;
+  } finally {
+    isConnecting = false;
   }
 };
 

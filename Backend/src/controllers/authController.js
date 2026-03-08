@@ -64,7 +64,7 @@ const login = async (req, res, next) => {
 
     // Check for user (include password since select: false is set in model)
     const user = await User.findOne({ email: email.toLowerCase() }).select(
-      "+password"
+      "+password",
     );
 
     if (!user) {
@@ -100,9 +100,13 @@ const login = async (req, res, next) => {
  */
 const logout = async (req, res, next) => {
   try {
+    const isProduction = process.env.NODE_ENV === "production";
     res.cookie("token", "none", {
       expires: new Date(Date.now() + 10 * 1000), // 10 seconds
       httpOnly: true,
+      secure: isProduction,
+      sameSite: isProduction ? "none" : "lax",
+      ...(process.env.COOKIE_DOMAIN && { domain: process.env.COOKIE_DOMAIN }),
     });
 
     res.status(200).json({
@@ -316,7 +320,8 @@ const forgotPassword = async (req, res, next) => {
       message:
         "If an account with that email exists, a password reset link has been sent.",
       // Include token in response for demo purposes (remove in production!)
-      resetToken: process.env.NODE_ENV === "development" ? resetToken : undefined,
+      resetToken:
+        process.env.NODE_ENV === "development" ? resetToken : undefined,
     });
   } catch (error) {
     next(error);
@@ -392,9 +397,13 @@ const deleteAccount = async (req, res, next) => {
     await User.findByIdAndDelete(req.user.id);
 
     // Clear cookie
+    const isProduction = process.env.NODE_ENV === "production";
     res.cookie("token", "none", {
       expires: new Date(Date.now() + 10 * 1000),
       httpOnly: true,
+      secure: isProduction,
+      sameSite: isProduction ? "none" : "lax",
+      ...(process.env.COOKIE_DOMAIN && { domain: process.env.COOKIE_DOMAIN }),
     });
 
     res.status(200).json({
@@ -409,16 +418,32 @@ const deleteAccount = async (req, res, next) => {
 
 /**
  * Helper function to create token response
+ *
+ * When frontend and backend are on different origins (e.g. two separate
+ * Vercel deployments or Vercel frontend + Railway/Render backend), cookies
+ * need `sameSite: "none"` + `secure: true` so the browser actually sends
+ * them on cross-origin requests. Using `"strict"` or `"lax"` would silently
+ * drop the cookie on cross-origin fetches, causing perpetual 401s.
  */
 const sendTokenResponse = (user, token, statusCode, res) => {
+  const isProduction = process.env.NODE_ENV === "production";
+
   // Cookie options
   const options = {
     expires: new Date(
-      Date.now() + (parseInt(process.env.JWT_COOKIE_EXPIRE, 10) || 7) * 24 * 60 * 60 * 1000
+      Date.now() +
+        (parseInt(process.env.JWT_COOKIE_EXPIRE, 10) || 7) *
+          24 *
+          60 *
+          60 *
+          1000,
     ),
     httpOnly: true,
-    secure: process.env.NODE_ENV === "production",
-    sameSite: process.env.NODE_ENV === "production" ? "strict" : "lax",
+    // In production cross-origin setups, cookies MUST be Secure + SameSite=None
+    secure: isProduction,
+    sameSite: isProduction ? "none" : "lax",
+    // If a custom cookie domain is configured, use it (e.g. ".yourdomain.com")
+    ...(process.env.COOKIE_DOMAIN && { domain: process.env.COOKIE_DOMAIN }),
   };
 
   res.status(statusCode).cookie("token", token, options).json({

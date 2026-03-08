@@ -1,4 +1,4 @@
-import { createContext, useState, useCallback, useEffect } from "react";
+import { createContext, useState, useCallback, useEffect, useRef } from "react";
 import api from "../services/api";
 
 export const AuthContext = createContext(null);
@@ -7,6 +7,9 @@ export const AuthProvider = ({ children }) => {
   const [user, setUser] = useState(null);
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
+  // Track whether the initial auth check is in progress to prevent
+  // the api interceptor from redirecting to /login during verification
+  const isVerifying = useRef(false);
 
   // Check for existing session on mount
   useEffect(() => {
@@ -15,6 +18,17 @@ export const AuthProvider = ({ children }) => {
       const storedUser = localStorage.getItem("user");
 
       if (token && storedUser) {
+        // Optimistically set the cached user so the UI doesn't flash
+        // a logged-out state while we verify the token
+        try {
+          const cached = JSON.parse(storedUser);
+          setUser(cached);
+          setIsAuthenticated(true);
+        } catch {
+          // Invalid JSON in storage, ignore
+        }
+
+        isVerifying.current = true;
         try {
           // Verify token with backend
           const response = await api.get("/auth/verify");
@@ -25,6 +39,8 @@ export const AuthProvider = ({ children }) => {
             localStorage.setItem("user", JSON.stringify(userData));
           } else {
             // Token invalid, clear storage
+            setUser(null);
+            setIsAuthenticated(false);
             localStorage.removeItem("token");
             localStorage.removeItem("user");
           }
@@ -32,18 +48,15 @@ export const AuthProvider = ({ children }) => {
           // If verify fails (e.g., server down), still use stored user for offline-ish mode
           // but if it's a 401, clear everything
           if (error.response && error.response.status === 401) {
+            setUser(null);
+            setIsAuthenticated(false);
             localStorage.removeItem("token");
             localStorage.removeItem("user");
-          } else {
-            // Server might be down, use cached user
-            try {
-              setUser(JSON.parse(storedUser));
-              setIsAuthenticated(true);
-            } catch {
-              localStorage.removeItem("token");
-              localStorage.removeItem("user");
-            }
           }
+          // For network errors / CORS errors / 5xx, keep using cached user
+          // so the app doesn't boot the user out when the backend is momentarily down
+        } finally {
+          isVerifying.current = false;
         }
       }
       setIsLoading(false);
@@ -117,17 +130,18 @@ export const AuthProvider = ({ children }) => {
   }, []);
 
   const logout = useCallback(async () => {
+    // Immediately clear local state so the UI updates right away
+    setUser(null);
+    setIsAuthenticated(false);
+    localStorage.removeItem("token");
+    localStorage.removeItem("user");
+
     try {
-      // Call backend logout endpoint
+      // Call backend logout endpoint to clear the httpOnly cookie
       await api.post("/auth/logout");
     } catch (error) {
-      // Even if the API call fails, clear local state
+      // Even if the API call fails, local state is already cleared
       console.warn("Logout API call failed:", error.message);
-    } finally {
-      setUser(null);
-      setIsAuthenticated(false);
-      localStorage.removeItem("token");
-      localStorage.removeItem("user");
     }
   }, []);
 
@@ -159,6 +173,7 @@ export const AuthProvider = ({ children }) => {
     user,
     isAuthenticated,
     isLoading,
+    isVerifying,
     login,
     signup,
     logout,
