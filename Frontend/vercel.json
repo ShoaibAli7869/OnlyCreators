@@ -1,15 +1,7 @@
 {
   "rewrites": [
     {
-      "source": "/api/:path*",
-      "destination": "https://onlycreators-backend.vercel.app/api/:path*"
-    },
-    {
-      "source": "/api",
-      "destination": "https://onlycreators-backend.vercel.app/api"
-    },
-    {
-      "source": "/((?!api).*)",
+      "source": "/(.*)",
       "destination": "/index.html"
     }
   ]
